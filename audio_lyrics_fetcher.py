@@ -23,7 +23,7 @@ class LyricsFetcher:
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
         })
         self.api_sources = ['lrclib', 'lyrics.ovh']  # Priority order
-    
+
     def fetch_lyrics_lrclib(self, artist, title):
         """Fetch lyrics from LRCLIB API (fast and reliable)"""
         try:
@@ -32,9 +32,9 @@ class LyricsFetcher:
                 'artist_name': artist,
                 'track_name': title
             }
-            
+
             response = self.session.get(url, params=params, timeout=10)
-            
+
             if response.status_code == 200:
                 data = response.json()
                 if data and len(data) > 0:
@@ -43,6 +43,9 @@ class LyricsFetcher:
                     if lyrics:
                         return lyrics
             return None
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            print(f"  ⚠️  Error from LRCLIB: {type(e).__name__}")
+            return "RETRY"
         except Exception as e:
             print(f"  ⚠️  Error from LRCLIB: {type(e).__name__}")
             return None
@@ -55,9 +58,9 @@ class LyricsFetcher:
                 'artist': artist,
                 'song': title
             }
-            
+
             response = self.session.get(url, params=params, timeout=10)
-            
+
             if response.status_code == 200:
                 # Parse XML response
                 import xml.etree.ElementTree as ET
@@ -66,6 +69,9 @@ class LyricsFetcher:
                 if lyrics is not None and lyrics.text:
                     return lyrics.text
             return None
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            print(f"  ⚠️  Error from ChartLyrics: {type(e).__name__}")
+            return "RETRY"
         except Exception as e:
             print(f"  ⚠️  Error from ChartLyrics: {type(e).__name__}")
             return None
@@ -75,13 +81,16 @@ class LyricsFetcher:
         try:
             url = f"https://api.lyrics.ovh/v1/{artist}/{title}"
             response = self.session.get(url, timeout=10)
-            
+
             if response.status_code == 200:
                 data = response.json()
                 lyrics = data.get('lyrics', '')
                 if lyrics:
                     return lyrics
             return None
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            print(f"  ⚠️  Error from lyrics.ovh: {type(e).__name__}")
+            return "RETRY"
         except Exception as e:
             print(f"  ⚠️  Error from lyrics.ovh: {type(e).__name__}")
             return None
@@ -108,35 +117,45 @@ class LyricsFetcher:
             print(f"  ⚠️  Error from alternative API: {type(e).__name__}")
             return None
     
+    def _try_source(self, name, fetch_func, *args, retries=2, delay=2):
+        """Try a lyrics source with retries on timeout"""
+        print(f"  📡 Trying {name}...")
+        for attempt in range(retries):
+            result = fetch_func(*args)
+            if result == "RETRY":
+                if attempt < retries - 1:
+                    print(f"  🔄 Retrying {name} in {delay}s...")
+                    time.sleep(delay)
+                continue
+            if result:
+                print(f"  ✅ Found lyrics from {name}!")
+                return result.strip()
+            return None
+        return None
+
     def fetch_lyrics(self, artist, title):
         """Main method to fetch lyrics with multiple fallback sources"""
         print(f"  🔍 Fetching lyrics for: {artist} - {title}")
-        
+
         # Clean up artist and title
         artist_clean = re.sub(r'[^\w\s-]', '', artist).strip()
         title_clean = re.sub(r'[^\w\s-]', '', title).strip()
-        
+
         # Try LRCLIB first (fastest and most reliable)
-        print(f"  📡 Trying LRCLIB...")
-        lyrics = self.fetch_lyrics_lrclib(artist, title)
+        lyrics = self._try_source("LRCLIB", self.fetch_lyrics_lrclib, artist, title)
         if lyrics:
-            print(f"  ✅ Found lyrics from LRCLIB!")
-            return lyrics.strip()
-        
+            return lyrics
+
         # Try ChartLyrics
-        print(f"  📡 Trying ChartLyrics...")
-        lyrics = self.fetch_lyrics_chartlyrics(artist, title)
+        lyrics = self._try_source("ChartLyrics", self.fetch_lyrics_chartlyrics, artist, title)
         if lyrics:
-            print(f"  ✅ Found lyrics from ChartLyrics!")
-            return lyrics.strip()
-        
+            return lyrics
+
         # Try lyrics.ovh
-        print(f"  📡 Trying lyrics.ovh...")
-        lyrics = self.fetch_lyrics_ovh(artist_clean, title_clean)
+        lyrics = self._try_source("lyrics.ovh", self.fetch_lyrics_ovh, artist_clean, title_clean)
         if lyrics:
-            print(f"  ✅ Found lyrics from lyrics.ovh!")
-            return lyrics.strip()
-        
+            return lyrics
+
         print(f"  ❌ No lyrics found from any source")
         return None
 
@@ -201,16 +220,10 @@ class AudioParser:
             print(f"  Error saving lyrics: {e}")
             return False
     
-    def process_audio_file(self, audio_path):
+    def process_audio_file(self, audio_path, current, total):
         """Process a single audio file"""
-        print(f"\n🎵 Processing: {audio_path.name}")
-        
-        # Check if lyrics file already exists
-        txt_path = audio_path.with_suffix('.txt')
-        if txt_path.exists():
-            print(f"  ⏭️  Skipping - lyrics file already exists")
-            return
-        
+        print(f"\n[{current}/{total}] 🎵 Processing: {audio_path.name}")
+
         # Extract metadata
         artist, title = self.extract_metadata(audio_path)
         
@@ -249,16 +262,24 @@ class AudioParser:
         
         # Remove duplicates
         audio_files = list(set(audio_files))
-        
+
         if not audio_files:
             print("❌ No audio files found")
             return
-        
-        print(f"📁 Found {len(audio_files)} audio files (FLAC, MP3, M4A/ALAC)\n")
+
+        # Filter out files that already have lyrics
+        audio_files = [f for f in audio_files if not f.with_suffix('.txt').exists()]
+
+        if not audio_files:
+            print("✅ All audio files already have lyrics")
+            return
+
+        print(f"📁 Found {len(audio_files)} audio files without lyrics\n")
         print("=" * 60)
-        
-        for audio_path in sorted(audio_files):
-            self.process_audio_file(audio_path)
+
+        total = len(audio_files)
+        for i, audio_path in enumerate(sorted(audio_files), 1):
+            self.process_audio_file(audio_path, i, total)
         
         # Print summary
         print("\n" + "=" * 60)
