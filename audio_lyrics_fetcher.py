@@ -38,42 +38,19 @@ class LyricsFetcher:
             if response.status_code == 200:
                 data = response.json()
                 if data and len(data) > 0:
-                    # Get the first result
-                    lyrics = data[0].get('plainLyrics', '') or data[0].get('syncedLyrics', '')
-                    if lyrics:
-                        return lyrics
+                    # Prefer synced lyrics over plain
+                    synced = data[0].get('syncedLyrics', '')
+                    plain = data[0].get('plainLyrics', '')
+                    if synced:
+                        return ('synced', synced)
+                    elif plain:
+                        return ('plain', plain)
             return None
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             print(f"  ⚠️  Error from LRCLIB: {type(e).__name__}")
             return "RETRY"
         except Exception as e:
             print(f"  ⚠️  Error from LRCLIB: {type(e).__name__}")
-            return None
-    
-    def fetch_lyrics_chartlyrics(self, artist, title):
-        """Fetch from ChartLyrics API"""
-        try:
-            url = "http://api.chartlyrics.com/apiv1.asmx/SearchLyricDirect"
-            params = {
-                'artist': artist,
-                'song': title
-            }
-
-            response = self.session.get(url, params=params, timeout=10)
-
-            if response.status_code == 200:
-                # Parse XML response
-                import xml.etree.ElementTree as ET
-                root = ET.fromstring(response.content)
-                lyrics = root.find('.//{http://api.chartlyrics.com/}Lyric')
-                if lyrics is not None and lyrics.text:
-                    return lyrics.text
-            return None
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            print(f"  ⚠️  Error from ChartLyrics: {type(e).__name__}")
-            return "RETRY"
-        except Exception as e:
-            print(f"  ⚠️  Error from ChartLyrics: {type(e).__name__}")
             return None
     
     def fetch_lyrics_ovh(self, artist, title):
@@ -86,7 +63,7 @@ class LyricsFetcher:
                 data = response.json()
                 lyrics = data.get('lyrics', '')
                 if lyrics:
-                    return lyrics
+                    return ('plain', lyrics)
             return None
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             print(f"  ⚠️  Error from lyrics.ovh: {type(e).__name__}")
@@ -95,30 +72,9 @@ class LyricsFetcher:
             print(f"  ⚠️  Error from lyrics.ovh: {type(e).__name__}")
             return None
     
-    def fetch_lyrics_api(self, artist, title):
-        """Fetch from alternative API source"""
-        try:
-            # Using a different API endpoint
-            artist_encoded = requests.utils.quote(artist)
-            title_encoded = requests.utils.quote(title)
-            url = f"https://api.allorigins.win/get?url=https://api.lyrics.ovh/v1/{artist_encoded}/{title_encoded}"
-            
-            response = self.session.get(url, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                if 'contents' in data:
-                    import json
-                    contents = json.loads(data['contents'])
-                    lyrics = contents.get('lyrics', '')
-                    if lyrics:
-                        return lyrics
-            return None
-        except Exception as e:
-            print(f"  ⚠️  Error from alternative API: {type(e).__name__}")
-            return None
-    
     def _try_source(self, name, fetch_func, *args, retries=2, delay=2):
-        """Try a lyrics source with retries on timeout"""
+        """Try a lyrics source with retries on timeout.
+        Returns tuple (lyrics_type, lyrics_text) or None."""
         print(f"  📡 Trying {name}...")
         for attempt in range(retries):
             result = fetch_func(*args)
@@ -128,33 +84,30 @@ class LyricsFetcher:
                     time.sleep(delay)
                 continue
             if result:
-                print(f"  ✅ Found lyrics from {name}!")
-                return result.strip()
+                lyrics_type, lyrics = result
+                print(f"  ✅ Found {lyrics_type} lyrics from {name}!")
+                return (lyrics_type, lyrics.strip())
             return None
         return None
 
     def fetch_lyrics(self, artist, title):
-        """Main method to fetch lyrics with multiple fallback sources"""
+        """Main method to fetch lyrics with multiple fallback sources.
+        Returns tuple (lyrics_type, lyrics_text) where lyrics_type is 'synced' or 'plain'."""
         print(f"  🔍 Fetching lyrics for: {artist} - {title}")
 
         # Clean up artist and title
         artist_clean = re.sub(r'[^\w\s-]', '', artist).strip()
         title_clean = re.sub(r'[^\w\s-]', '', title).strip()
 
-        # Try LRCLIB first (fastest and most reliable)
-        lyrics = self._try_source("LRCLIB", self.fetch_lyrics_lrclib, artist, title)
-        if lyrics:
-            return lyrics
-
-        # Try ChartLyrics
-        lyrics = self._try_source("ChartLyrics", self.fetch_lyrics_chartlyrics, artist, title)
-        if lyrics:
-            return lyrics
+        # Try LRCLIB first (fastest, most reliable, has synced lyrics)
+        result = self._try_source("LRCLIB", self.fetch_lyrics_lrclib, artist, title)
+        if result:
+            return result
 
         # Try lyrics.ovh
-        lyrics = self._try_source("lyrics.ovh", self.fetch_lyrics_ovh, artist_clean, title_clean)
-        if lyrics:
-            return lyrics
+        result = self._try_source("lyrics.ovh", self.fetch_lyrics_ovh, artist_clean, title_clean)
+        if result:
+            return result
 
         print(f"  ❌ No lyrics found from any source")
         return None
@@ -207,14 +160,16 @@ class AudioParser:
             print(f"Error reading metadata from {audio_path.name}: {e}")
             return None, None
     
-    def save_lyrics(self, audio_path, lyrics):
-        """Save lyrics to a text file with same name as audio file"""
-        txt_path = audio_path.with_suffix('.txt')
-        
+    def save_lyrics(self, audio_path, lyrics_type, lyrics):
+        """Save lyrics to file with same name as audio file.
+        Synced lyrics save as .lrc, plain lyrics save as .txt"""
+        ext = '.lrc' if lyrics_type == 'synced' else '.txt'
+        out_path = audio_path.with_suffix(ext)
+
         try:
-            with open(txt_path, 'w', encoding='utf-8') as f:
+            with open(out_path, 'w', encoding='utf-8') as f:
                 f.write(lyrics)
-            print(f"  ✓ Saved to: {txt_path.name}")
+            print(f"  ✓ Saved to: {out_path.name}")
             return True
         except Exception as e:
             print(f"  Error saving lyrics: {e}")
@@ -233,10 +188,11 @@ class AudioParser:
             return
         
         # Fetch lyrics
-        lyrics = self.lyrics_fetcher.fetch_lyrics(artist, title)
-        
-        if lyrics:
-            if self.save_lyrics(audio_path, lyrics):
+        result = self.lyrics_fetcher.fetch_lyrics(artist, title)
+
+        if result:
+            lyrics_type, lyrics = result
+            if self.save_lyrics(audio_path, lyrics_type, lyrics):
                 self.found += 1
         else:
             self.errors += 1
@@ -267,11 +223,13 @@ class AudioParser:
             print("❌ No audio files found")
             return
 
-        # Filter out files that already have lyrics
-        audio_files = [f for f in audio_files if not f.with_suffix('.txt').exists()]
+        # Filter out files that already have lyrics (.lrc or .txt)
+        audio_files = [f for f in audio_files
+                       if not f.with_suffix('.lrc').exists()
+                       and not f.with_suffix('.txt').exists()]
 
         if not audio_files:
-            print("✅ All audio files already have lyrics")
+            print("✅ All audio files already have lyrics (.lrc or .txt)")
             return
 
         print(f"📁 Found {len(audio_files)} audio files without lyrics\n")
